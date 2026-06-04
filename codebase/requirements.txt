@@ -1,0 +1,17 @@
+# Discord Class Bot - Dependencies
+# Python 3.9+
+
+# Discord
+discord.py>=2.3.0
+
+# OpenAI (via OpenRouter)
+openai>=1.0.0
+
+# Vector Database
+chromadb>=0.4.0
+
+# Web UI (for testing)
+flask>=3.0.0
+
+# Utilities
+python-dotenv>=1.0.0

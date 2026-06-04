@@ -94,6 +94,32 @@ TOOL_GET_MESSAGE_CONTEXT = {
     },
 }
 
+TOOL_SEARCH_BY_USER = {
+    "type": "function",
+    "function": {
+        "name": "search_messages_by_user",
+        "description": (
+            "Tìm kiếm tất cả tin nhắn của một người dùng cụ thể trong kênh Discord. "
+            "Dùng khi user yêu cầu tóm tắt/xem tin nhắn của một người cụ thể."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "author_id": {
+                    "type": "string",
+                    "description": "ID của người dùng cần tìm",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Số lượng kết quả tối đa (mặc định 10)",
+                    "default": 10,
+                },
+            },
+            "required": ["author_id"],
+        },
+    },
+}
+
 TOOL_SUBMIT_CORRECTION = {
     "type": "function",
     "function": {
@@ -123,8 +149,16 @@ ALL_TOOLS = [
     TOOL_SEARCH_HISTORY,
     TOOL_SUMMARIZE_TOPIC,
     TOOL_GET_MESSAGE_CONTEXT,
+    TOOL_SEARCH_BY_USER,
     TOOL_SUBMIT_CORRECTION,
 ]
+
+_VALID_TOOL_NAMES = frozenset(t["function"]["name"] for t in ALL_TOOLS)
+_MAX_CONTEXT_CHARS = 24000
+
+
+def _estimate_chars(messages: list[dict]) -> int:
+    return sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
 
 
 # ── system prompt ──────────────────────────────────────────────────────────
@@ -134,11 +168,13 @@ Bạn là trợ lý AI cho lớp học Discord. Bạn tìm kiếm lịch sử ch
 
 Quy tắc:
 1. LUÔN gọi `search_history` trước khi trả lời.
-2. Phân biệt nguồn: giảng viên (is_instructor=true) → tin cậy cao; học viên → cần kiểm chứng.
-3. Khi trích dẫn: [text](https://discord.com/channels/{guild_id}/{channel_id}/{message_id})
-4. Không tìm thấy → nói rõ & gợi ý hỏi giảng viên. Mâu thuẫn → chỉ ra cả 2 nguồn.
-5. Trả lời ngắn gọn, tiếng Việt. KHÔNG bịa thông tin.
-6. Kết thúc: "🔬 Cao" / "🧐 Trung bình" / "🌫️ Thấp" (theo mức tin cậy).
+2. Khi user hỏi về bản thân (VD: "tôi là ai", "tôi đã nói gì"), LUÔN dùng `search_messages_by_user` với author_id của người đang hỏi (có trong context). KHÔNG được gán identity của người khác cho người hỏi.
+3. Khi user hỏi về tin nhắn của một người cụ thể, hãy dùng `search_messages_by_user` với author_id được cung cấp trong context.
+4. Phân biệt nguồn: giảng viên (is_instructor=true) → tin cậy cao; học viên → cần kiểm chứng.
+5. Khi trích dẫn: [text](https://discord.com/channels/{guild_id}/{channel_id}/{message_id})
+6. Không tìm thấy → nói rõ & gợi ý hỏi giảng viên. Mâu thuẫn → chỉ ra cả 2 nguồn.
+7. Trả lời ngắn gọn, tiếng Việt. KHÔNG bịa thông tin.
+8. Kết thúc: "🔬 Cao" / "🧐 Trung bình" / "🌫️ Thấp" (theo mức tin cậy).
 """
 
 
@@ -181,9 +217,16 @@ async def run_agent(
     collected_sources: list[dict] = []
     seen_source_ids: set[str] = set()
     correction_submitted = False
+    prev_tool_calls: set[tuple[str, str]] = set()  # (fn_name, args_json) for dedup
+    final_content_buffer: str = ""  # accumulate content returned alongside tool_calls
 
     for step in range(settings.agent_max_steps):
-        log.debug("Agent step %d/%d", step + 1, settings.agent_max_steps)
+        log.info("Agent step %d/%d", step + 1, settings.agent_max_steps)
+
+        # --- context overflow guard: truncate earliest messages if too large ---
+        while _estimate_chars(messages) > _MAX_CONTEXT_CHARS and len(messages) > 2:
+            removed = messages.pop(1)
+            log.debug("Dropping message from context (size overflow)")
 
         try:
             msg = await call_llm(settings, messages, tools=ALL_TOOLS)
@@ -194,48 +237,89 @@ async def run_agent(
                 confidence="low",
             )
 
-        finish_reason = "stop"
-        # Determine finish reason from the message structure
+        content = msg.get("content", "") or ""
         tool_calls = msg.get("tool_calls")
-        if tool_calls:
-            finish_reason = "tool_calls"
 
-        if finish_reason != "tool_calls" or not tool_calls:
-            # Final answer
-            content = msg.get("content", "")
-            if not content:
-                content = (
+        # --- edge case 1: LLM returns both content and tool_calls ---
+        # Buffer the content so it's not lost; include it in the final answer if
+        # the loop terminates without a clean stop.
+        if content.strip():
+            final_content_buffer = content.strip()
+            log.info("LLM content alongside tool_calls: %s", content[:200])
+
+        # --- no tool calls → final answer ---
+        if not tool_calls:
+            answer = content.strip() or final_content_buffer
+            log.info("LLM final answer: %s", answer[:300])
+            if not answer:
+                answer = (
                     "Xin lỗi, mình chưa tìm thấy thông tin phù hợp trong lịch sử chat để trả lời câu hỏi này. "
                     "Bạn thử hỏi cụ thể hơn nhé!"
                 )
             return AgentResponse(
-                answer=content,
-                confidence=_infer_confidence(content),
+                answer=answer,
+                confidence=_infer_confidence(answer),
                 sources=collected_sources,
                 correction_submitted=correction_submitted,
             )
 
-        # Append assistant message with tool_calls
-        messages.append(msg)
-
-        # Execute each tool call
+        # --- edge case 5: dedup identical tool calls ---
+        deduped_calls = []
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
-            try:
-                fn_args = json.loads(tc["function"]["arguments"])
-            except json.JSONDecodeError:
-                fn_args = {}
+            fn_args_str = tc["function"].get("arguments", "{}")
+            call_key = (fn_name, fn_args_str)
+            if call_key not in prev_tool_calls:
+                deduped_calls.append(tc)
+                prev_tool_calls.add(call_key)
+            else:
+                log.info("Skipping duplicate tool call: %s", fn_name)
 
-            result = await _execute_tool(
-                fn_name, fn_args, rag, corrections,
-                guild_id, corrected_by,
+        if not deduped_calls:
+            log.warning("All tool calls were duplicates — forcing early exit")
+            answer = final_content_buffer or (
+                "Xin lỗi, mình không tìm thấy thêm thông tin mới. "
+                "Bạn thử hỏi cụ thể hơn nhé!"
             )
+            return AgentResponse(
+                answer=answer,
+                confidence="low",
+                sources=collected_sources,
+                correction_submitted=correction_submitted,
+            )
+
+        # Append assistant message with deduped tool_calls
+        messages.append({**msg, "tool_calls": deduped_calls})
+        log.info("LLM tool calls: %s", [tc["function"]["name"] for tc in deduped_calls])
+
+        # --- edge case 3, 4: execute each tool safely ---
+        for tc in deduped_calls:
+            fn_name = tc["function"]["name"]
+
+            # edge case 2: validate tool name
+            if fn_name not in _VALID_TOOL_NAMES:
+                log.warning("Unknown tool: %s — returning error", fn_name)
+                result = {"error": f"Unknown tool: {fn_name}"}
+            else:
+                try:
+                    fn_args = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                # edge case 3: wrap execution in try/except
+                try:
+                    result = await _execute_tool(
+                        fn_name, fn_args, rag, corrections,
+                        guild_id, corrected_by,
+                    )
+                except Exception:
+                    log.exception("Tool execution failed: %s", fn_name)
+                    result = {"error": f"Tool '{fn_name}' execution failed"}
 
             if fn_name == "submit_correction":
                 correction_submitted = True
 
-            # Collect sources from search results (dedup by link)
-            if fn_name in ("search_history", "summarize_topic"):
+            if fn_name in ("search_history", "summarize_topic", "search_messages_by_user"):
                 if isinstance(result, dict) and "results" in result:
                     for r in result["results"]:
                         link = r.get("link", "")
@@ -243,18 +327,20 @@ async def run_agent(
                             seen_source_ids.add(link)
                             collected_sources.append(r)
 
-            # Append tool result
+            # edge case 4: guard missing tool_call_id
+            tc_id = tc.get("id", f"call_{step}_{fn_name}")
+
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc["id"],
+                "tool_call_id": tc_id,
                 "content": json.dumps(result, ensure_ascii=False),
             })
 
-    # Max steps reached — force a final answer
-    messages.append({
-        "role": "user",
-        "content": "Hãy đưa ra câu trả lời cuối cùng dựa trên thông tin đã thu thập.",
-    })
+    # --- max steps reached — force a final answer ---
+    prompt = "Hãy đưa ra câu trả lời cuối cùng dựa trên thông tin đã thu thập."
+    if final_content_buffer:
+        prompt = f"Trước đó bạn đã nói: {final_content_buffer}\n\n{prompt}"
+    messages.append({"role": "user", "content": prompt})
     try:
         msg = await call_llm(settings, messages)
         content = msg.get("content", "")
@@ -262,7 +348,7 @@ async def run_agent(
         content = ""
 
     if not content:
-        content = (
+        content = final_content_buffer or (
             "Xin lỗi, mình chưa tìm thấy thông tin phù hợp trong lịch sử chat để trả lời câu hỏi này. "
             "Bạn thử hỏi cụ thể hơn nhé!"
         )
@@ -291,7 +377,7 @@ async def _execute_tool(
     if name == "search_history":
         query = args.get("query", "")
         top_k = args.get("top_k", 5)
-        results = rag.search(query, top_k=top_k, threshold=0.0)
+        results = await rag.search(query, top_k=top_k, threshold=0.0)
         return {
             "results": _format_search_results(results, guild_id),
             "count": len(results),
@@ -300,7 +386,7 @@ async def _execute_tool(
     if name == "summarize_topic":
         topic = args.get("topic", "")
         num_chunks = args.get("num_chunks", 15)
-        results = rag.search(topic, top_k=num_chunks, threshold=0.0)
+        results = await rag.search(topic, top_k=num_chunks, threshold=0.0)
         return {
             "results": _format_search_results(results, guild_id),
             "count": len(results),
@@ -309,10 +395,19 @@ async def _execute_tool(
     if name == "get_message_context":
         message_id = args.get("message_id", "")
         window = args.get("window", 3)
-        context = rag.get_context_around(message_id, window=window)
+        context = await rag.get_context_around(message_id, window=window)
         return {
             "context": context,
             "found": len(context) > 0,
+        }
+
+    if name == "search_messages_by_user":
+        author_id = args.get("author_id", "")
+        top_k = args.get("top_k", 10)
+        results = await rag.search_by_user(author_id, top_k=top_k)
+        return {
+            "results": _format_search_results(results, guild_id),
+            "count": len(results),
         }
 
     if name == "submit_correction":
@@ -340,9 +435,9 @@ def _format_search_results(results: list[dict], guild_id: str) -> list[dict]:
         gid = r.get("guild_id") or guild_id or "0"
         link = f"https://discord.com/channels/{gid}/{r['channel_id']}/{r['message_id']}"
         content = r.get("content", "")
-        # Truncate content — LLM only needs the gist, not full 1500-char chunks
-        if len(content) > 400:
-            content = content[:400] + "…"
+        # Truncate content — keep enough context for LLM to understand
+        if len(content) > 1000:
+            content = content[:1000] + "…"
         formatted.append({
             "content": content,
             "author": r["author"],

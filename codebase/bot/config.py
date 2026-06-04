@@ -14,7 +14,7 @@ def _parse_channel_ids() -> list[int]:
         return [int(cid.strip()) for cid in raw.split(",") if cid.strip()]
     single = os.environ.get("TARGET_CHANNEL_ID", "")
     if single:
-        return [int(single)]
+        return [int(cid.strip()) for cid in single.split(",") if cid.strip()]
     return []
 
 
@@ -45,6 +45,9 @@ class Settings:
     chunk_overlap: int = 200
     top_k: int = 5
     relevance_threshold: float = 0.01
+    auto_delete_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("AUTO_DELETE_SECONDS", "60"))
+    )
     history_limit: int = field(
         default_factory=lambda: int(os.environ.get("HISTORY_LIMIT", "5000"))
     )

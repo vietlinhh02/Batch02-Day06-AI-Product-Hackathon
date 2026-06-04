@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -251,6 +252,7 @@ class QACog(commands.Cog):
         self.bot = bot
         self.settings = settings
         self._rags: dict[int, RAGStore] = {}  # channel_id -> RAGStore
+        self._history_locks: dict[int, asyncio.Lock] = {}  # channel_id -> lock
         self.corrections = CorrectionStore()
         self.corrections.load_from_file(settings.corrections_file)
 
@@ -277,22 +279,24 @@ class QACog(commands.Cog):
         if not message.guild:
             return
 
-        # ── Real-time indexing: buffer every human message ──
-        rag = self._get_rag(message.channel.id)
-        if rag.chunks:  # only index if channel was already loaded
-            msg_data = await _msg_to_dict(message)
-            pending_count = rag.append_message(msg_data, self.settings)
-            if pending_count >= 20:
-                new_chunks = rag.flush_pending(self.settings)
-                if new_chunks:
-                    rag.save_to_cache(message.channel.id)
-                    log.info("Auto-flushed %d new chunks for channel %s", new_chunks, message.channel.id)
+        # ── Real-time indexing: only index messages in target channels ──
+        if message.channel.id in self.settings.target_channel_ids:
+            rag = self._get_rag(message.channel.id)
+            if rag.chunks:  # only index if channel was already loaded
+                msg_data = await _msg_to_dict(message)
+                pending_count = rag.append_message(msg_data, self.settings)
+                if pending_count >= 20:
+                    new_chunks = await rag.flush_pending(self.settings)
+                    if new_chunks:
+                        rag.save_to_cache(message.channel.id)
+                        log.info("Auto-flushed %d new chunks for channel %s", new_chunks, message.channel.id)
 
         # ── Mention reply ──
         if self.bot.user not in message.mentions:
             return
 
         question = message.content
+        mentioned_users = [m for m in message.mentions if m.id != self.bot.user.id]
         for mention in message.mentions:
             question = question.replace(mention.mention, "").strip()
 
@@ -310,31 +314,47 @@ class QACog(commands.Cog):
             )
             return
 
-        # Use the channel where the question was asked as context source
-        channel_id = message.channel.id
+        # Resolve which channel to query against
+        source_channel_id = self._resolve_source_channel(message.channel.id)
+        rag = self._get_rag(source_channel_id)
+
         if not rag.chunks:
             status_msg = await message.reply("🔄 Đang tải lịch sử chat... (lần đầu)")
-            await self._load_history(channel_id)
+            await self._load_history(source_channel_id)
             try:
                 await status_msg.delete()
             except discord.HTTPException:
                 pass
         else:
-            await self._load_history(channel_id)
+            await self._load_history(source_channel_id)
 
         # Flush any real-time buffered messages before query
-        rag.flush_pending(self.settings)
+        await rag.flush_pending(self.settings)
 
         async with message.channel.typing():
             guild_id = str(message.guild.id)
+            log.info("Processing question from %s: %s", message.author.display_name, question[:200])
+
+            # Inject current user + mentioned users context
+            user_ctx = f"Người đang hỏi: ID={message.author.id} (tên={message.author.display_name})"
+            enriched_question = f"[Context: {user_ctx}] {question}"
+            if mentioned_users:
+                user_tags = ", ".join(
+                    f"ID={u.id} (tên={u.display_name})" for u in mentioned_users
+                )
+                enriched_question = f"[Context: {user_ctx} | Người được nhắc đến: {user_tags}] {question}"
+                log.info("Mentioned users: %s", user_tags)
+
             response: AgentResponse = await run_agent(
                 self.settings,
-                question,
+                enriched_question,
                 rag,
                 self.corrections,
                 guild_id,
                 corrected_by=message.author.display_name,
             )
+            log.info("Response ready — confidence=%s, sources=%d, answer_len=%d",
+                     response.confidence, len(response.sources), len(response.answer))
 
         if response.correction_submitted:
             self.corrections.save_to_file(self.settings.corrections_file)
@@ -342,7 +362,21 @@ class QACog(commands.Cog):
         embed = _build_answer_embed(
             response, question, message.author, self.bot.user,
         )
-        await message.reply(embed=embed, mention_author=False)
+        bot_reply = await message.reply(embed=embed, mention_author=False)
+
+        # Auto-delete both user question and bot reply after configured seconds
+        if self.settings.auto_delete_seconds > 0:
+            async def _auto_delete():
+                await asyncio.sleep(self.settings.auto_delete_seconds)
+                try:
+                    await message.delete()
+                except (discord.HTTPException, discord.NotFound):
+                    pass
+                try:
+                    await bot_reply.delete()
+                except (discord.HTTPException, discord.NotFound):
+                    pass
+            asyncio.create_task(_auto_delete())
 
     # ── /ask (kept for discoverability) ─────────────────────────────────────
 
@@ -357,7 +391,7 @@ class QACog(commands.Cog):
             log.warning("/ask interaction expired before defer")
             return
 
-        channel_id = interaction.channel_id
+        channel_id = self._resolve_source_channel(interaction.channel_id)
         rag = self._get_rag(channel_id)
         if not rag.chunks:
             await send("🔄 Đang tải lịch sử chat... (lần đầu)")
@@ -365,7 +399,7 @@ class QACog(commands.Cog):
         else:
             await self._load_history(channel_id)
 
-        rag.flush_pending(self.settings)
+        await rag.flush_pending(self.settings)
 
         guild_id = str(interaction.guild_id or "")
         response: AgentResponse = await run_agent(
@@ -379,7 +413,7 @@ class QACog(commands.Cog):
         embed = _build_answer_embed(
             response, question, interaction.user, self.bot.user,
         )
-        await send(embed=embed)
+        await send(embed=embed, delete_after=self.settings.auto_delete_seconds)
 
     # ── /summary ────────────────────────────────────────────────────────────
 
@@ -394,7 +428,7 @@ class QACog(commands.Cog):
             log.warning("/summary interaction expired before defer")
             return
 
-        channel_id = interaction.channel_id
+        channel_id = self._resolve_source_channel(interaction.channel_id)
         rag = self._get_rag(channel_id)
         if not rag.chunks:
             await send("🔄 Đang tải lịch sử chat...")
@@ -402,7 +436,7 @@ class QACog(commands.Cog):
         else:
             await self._load_history(channel_id)
 
-        rag.flush_pending(self.settings)
+        await rag.flush_pending(self.settings)
 
         summary_question = (
             f"Hãy tóm tắt chi tiết chủ đề sau từ lịch sử chat lớp học: '{topic}'. "
@@ -461,7 +495,7 @@ class QACog(commands.Cog):
             log.warning("/reload interaction expired before defer")
             return
 
-        channel_id = interaction.channel_id
+        channel_id = self._resolve_source_channel(interaction.channel_id)
         rag = self._get_rag(channel_id)
         rag.last_timestamp = ""  # force full rebuild
         await self._load_history(channel_id)
@@ -471,45 +505,50 @@ class QACog(commands.Cog):
     # ── history loader (incremental) ────────────────────────────────────────
 
     async def _load_history(self, channel_id: int) -> None:
-        """Fetch messages from Discord, incremental if already have cached data."""
-        channel = self.bot.get_channel(channel_id)
-        if channel is None:
-            log.warning("Channel %s not found or not accessible", channel_id)
-            return
-        if not isinstance(channel, discord.TextChannel):
-            log.warning(
-                "Channel %s is not a TextChannel (got %s)",
-                channel_id, type(channel).__name__,
-            )
-            return
+        """Fetch messages from Discord, incremental if already have cached data.
 
-        rag = self._get_rag(channel_id)
-
-        # Determine fetch strategy: incremental vs full
-        last_ts = rag.last_timestamp
-        after_dt = None
-        if last_ts:
-            try:
-                after_dt = datetime.fromisoformat(last_ts)
-            except ValueError:
-                pass
-
-        if after_dt:
-            log.info("Incremental fetch for channel %s — after %s", channel_id, last_ts)
-            messages = await _fetch_messages(channel, limit=None, after=after_dt)
-            if not messages:
-                log.info("No new messages since %s", last_ts)
+        Uses per-channel lock to prevent concurrent fetches (on_message + slash command race).
+        """
+        lock = self._history_locks.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            channel = self.bot.get_channel(channel_id)
+            if channel is None:
+                log.warning("Channel %s not found or not accessible", channel_id)
                 return
-            new_count = rag.extend(messages, self.settings)
-            log.info("Added %d new chunks from %d messages (incremental)",
-                     new_count, len(messages))
-        else:
-            log.info("Full fetch for channel %s (limit=%d)", channel_id, self.settings.history_limit)
-            messages = await _fetch_messages(channel, limit=self.settings.history_limit)
-            rag.build(messages, self.settings)
-            log.info("Full build: %d messages -> %d chunks", len(messages), len(rag.chunks))
+            if not isinstance(channel, discord.TextChannel):
+                log.warning(
+                    "Channel %s is not a TextChannel (got %s)",
+                    channel_id, type(channel).__name__,
+                )
+                return
 
-        rag.save_to_cache(channel_id)
+            rag = self._get_rag(channel_id)
+
+            # Determine fetch strategy: incremental vs full
+            last_ts = rag.last_timestamp
+            after_dt = None
+            if last_ts:
+                try:
+                    after_dt = datetime.fromisoformat(last_ts)
+                except ValueError:
+                    pass
+
+            if after_dt:
+                log.info("Incremental fetch for channel %s — after %s", channel_id, last_ts)
+                messages = await _fetch_messages(channel, limit=None, after=after_dt)
+                if not messages:
+                    log.info("No new messages since %s", last_ts)
+                    return
+                new_count = await rag.extend(messages, self.settings)
+                log.info("Added %d new chunks from %d messages (incremental)",
+                         new_count, len(messages))
+            else:
+                log.info("Full fetch for channel %s (limit=%d)", channel_id, self.settings.history_limit)
+                messages = await _fetch_messages(channel, limit=self.settings.history_limit)
+                await rag.build(messages, self.settings)
+                log.info("Full build: %d messages -> %d chunks", len(messages), len(rag.chunks))
+
+            rag.save_to_cache(channel_id)
 
     def _get_rag(self, channel_id: int) -> RAGStore:
         """Get or create RAGStore for a channel."""
@@ -520,3 +559,16 @@ class QACog(commands.Cog):
                 log.info("No cache for channel %s — will fetch on demand", channel_id)
             self._rags[channel_id] = rag
         return self._rags[channel_id]
+
+    def _resolve_source_channel(self, current_channel_id: int) -> int:
+        """Pick the best target channel to query against.
+        
+        If current channel is a target channel, use it directly.
+        Otherwise fall back to the first configured target channel.
+        """
+        target_ids = self.settings.target_channel_ids
+        if current_channel_id in target_ids:
+            return current_channel_id
+        if target_ids:
+            return target_ids[0]
+        return current_channel_id

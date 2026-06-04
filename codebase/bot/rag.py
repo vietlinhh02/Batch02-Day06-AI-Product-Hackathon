@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import pickle
@@ -48,6 +49,7 @@ class RAGStore:
     _tokenized_corpus: list[list[str]] = field(default_factory=list)
     last_timestamp: str = ""  # ISO timestamp of the most recent indexed message
     _pending: list[dict] = field(default_factory=list)  # unindexed messages
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # ── initialisation ──────────────────────────────────────────────────────
 
@@ -59,33 +61,38 @@ class RAGStore:
 
     # ── build ───────────────────────────────────────────────────────────────
 
-    def build(self, messages: list[dict], settings: Settings) -> None:
+    async def build(self, messages: list[dict], settings: Settings) -> None:
         """Full rebuild: chunk messages, build BM25 index, and compute embeddings."""
-        self.chunks = _build_chunks(messages, settings)
-        if not self.chunks:
-            log.warning("No chunks built — all messages were empty or from bots")
-            return
-
-        # Track latest timestamp for incremental fetches
-        self.last_timestamp = _latest_ts(self.chunks)
-
-        self._rebuild_index(settings)
+        async with self._lock:
+            self.chunks = _build_chunks(messages, settings)
+            if not self.chunks:
+                log.warning("No chunks built — all messages were empty or from bots")
+                return
+            self.last_timestamp = _latest_ts(self.chunks)
+            self._rebuild_index(settings)
 
     def append_message(self, msg_data: dict, settings: Settings) -> int:
         """Buffer a single message from a real-time listener. Flush before queries."""
         self._pending.append(msg_data)
         return len(self._pending)
 
-    def flush_pending(self, settings: Settings) -> int:
+    async def flush_pending(self, settings: Settings) -> int:
         """Index all buffered messages. Returns number of new chunks."""
-        if not self._pending:
-            return 0
-        count = self.extend(self._pending, settings)
-        self._pending = []
-        return count
+        async with self._lock:
+            if not self._pending:
+                return 0
+            # Snapshoot and clear to avoid race with on_message appends
+            batch = self._pending
+            self._pending = []
+            count = self._extend_sync(batch, settings)
+            return count
 
-    def extend(self, messages: list[dict], settings: Settings) -> int:
+    async def extend(self, messages: list[dict], settings: Settings) -> int:
         """Add new messages to the existing index (incremental). Returns new chunk count."""
+        async with self._lock:
+            return self._extend_sync(messages, settings)
+
+    def _extend_sync(self, messages: list[dict], settings: Settings) -> int:
         if not messages:
             return 0
 
@@ -212,14 +219,28 @@ class RAGStore:
 
     # ── search ──────────────────────────────────────────────────────────────
 
-    def search(
+    async def search(
         self,
         query: str,
         top_k: int = 5,
         threshold: float = 0.0,
     ) -> list[dict]:
-        """Hybrid search: vector cosine + BM25, merged with RRF."""
-        if not self.chunks or self._embeddings is None or self._bm25 is None:
+        """Hybrid search: vector cosine + BM25, merged with RRF.
+
+        Thread-safe via asyncio.Lock.
+        """
+        async with self._lock:
+            return self._search_sync(query, top_k, threshold)
+
+    def _search_sync(
+        self,
+        query: str,
+        top_k: int = 5,
+        threshold: float = 0.0,
+    ) -> list[dict]:
+        """Synchronous search logic (must be called under _lock)."""
+        query = (query or "").strip()
+        if not query or not self.chunks or self._embeddings is None or self._bm25 is None:
             return []
 
         # --- Vector retrieval ---
@@ -231,6 +252,8 @@ class RAGStore:
             np.linalg.norm(self._embeddings, axis=1, keepdims=True) + 1e-10
         )
         cos_scores = e_norms @ q_norm
+        # --- edge case 10: NaN guard (zero-vector chunks produce NaN after division) ---
+        cos_scores = np.nan_to_num(cos_scores, nan=0.0)
         vec_top = np.argsort(-cos_scores)[:_CANDIDATE_POOL]
         vec_ranked = {int(idx): rank for rank, idx in enumerate(vec_top)}
 
@@ -289,8 +312,12 @@ class RAGStore:
 
         return results
 
-    def get_context_around(self, message_id: str, window: int = 3) -> list[dict]:
+    async def get_context_around(self, message_id: str, window: int = 3) -> list[dict]:
         """Return chunks surrounding a specific message ID."""
+        async with self._lock:
+            return self._get_context_around_sync(message_id, window)
+
+    def _get_context_around_sync(self, message_id: str, window: int = 3) -> list[dict]:
         target_indices = [
             i for i, c in enumerate(self.chunks) if c.message_id == message_id
         ]
@@ -312,6 +339,31 @@ class RAGStore:
                 "channel_id": chunk.channel_id,
                 "guild_id": chunk.guild_id,
                 "timestamp": chunk.timestamp,
+            })
+        return results
+
+    async def search_by_user(self, author_id: str, top_k: int = 10, sort_by_time: bool = True) -> list[dict]:
+        """Return all chunks from a specific user, sorted by recency."""
+        async with self._lock:
+            return self._search_by_user_sync(author_id, top_k, sort_by_time)
+
+    def _search_by_user_sync(self, author_id: str, top_k: int = 10, sort_by_time: bool = True) -> list[dict]:
+        matches = [c for c in self.chunks if c.author_id == author_id]
+        if sort_by_time:
+            matches.sort(key=lambda c: c.timestamp, reverse=True)
+        results: list[dict] = []
+        for chunk in matches[:top_k]:
+            results.append({
+                "content": chunk.content,
+                "author": chunk.author,
+                "author_id": chunk.author_id,
+                "is_instructor": chunk.is_instructor,
+                "message_id": chunk.message_id,
+                "channel_id": chunk.channel_id,
+                "guild_id": chunk.guild_id,
+                "timestamp": chunk.timestamp,
+                "reply_to_id": chunk.reply_to_id,
+                "score": 1.0,
             })
         return results
 

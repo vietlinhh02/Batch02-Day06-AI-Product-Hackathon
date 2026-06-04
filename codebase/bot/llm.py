@@ -51,8 +51,8 @@ async def call_llm(
     finish = data["choices"][0].get("finish_reason", "")
     usage = data.get("usage", {})
 
-    log.debug(
-        "LLM call: finish=%s, tokens=%s, tool_calls=%d",
+    log.info(
+        "LLM call done: finish=%s, tokens=%s, tool_calls=%d",
         finish,
         usage.get("total_tokens", "?"),
         len(msg.get("tool_calls") or []),
